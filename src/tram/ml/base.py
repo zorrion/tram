@@ -24,6 +24,19 @@ from sklearn.naive_bayes import MultinomialNB
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.feature_selection import chi2, SelectPercentile
+from nltk.stem.snowball import EnglishStemmer
+from nltk.corpus import stopwords
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.svm import LinearSVC
+from nltk import word_tokenize
+from sklearn.feature_extraction import text as tsk
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.preprocessing import LabelEncoder
+
+import numpy as np
+
 # The word model is overloaded in this scope, so a prefix is necessary
 from tram import models as db_models
 
@@ -331,12 +344,233 @@ class MLPClassifierModel(SKLearnModel):
             ]
         )
 
+class AdversaryModel(SKLearnModel):
+    def train(self):
+        """
+        Load and preprocess data. Train model pipeline
+        """
+        X, y = self._load_and_vectorize_data()
+        
+        ohe = LabelEncoder()
+        y = [i for i in y]
+        y_vec = ohe.fit_transform(y)
+
+        self.techniques_model.fit(X, y_vec)
+        self.last_trained = datetime.now(timezone.utc)
+
+
+    def _load_and_vectorize_data(self):
+        """
+        Load training data from database.
+        Store sentence text in vector X
+        Store attack technique in vector y
+        """
+        X = []
+        y = []
+
+        # accepted_sents = self.get_training_data()
+        # reports = db_models.Report.objects.filter(ml_model='fullreport')
+        reports = db_models.Report.objects.filter(ml_model='adversary')
+
+        for report_obj in reports:  # Only store sentences with a labeled technique
+            text = report_obj.text
+            label = ''
+            # temp = []
+            mappings = db_models.AdversaryMapping.objects.filter(report=report_obj)
+            for mapping in mappings:
+                label = mapping.adversary.name
+            X.append(text)
+            y.append(label)
+        return X, y
+
+
+    def get_model(self):
+        return Pipeline([
+            ("features", tsk.TfidfVectorizer()),
+            ("clf", LinearSVC())
+        ])
+
+
+class FullReportModel(SKLearnModel):
+    """
+    Full report model:
+    predicts on full report instead of per sentence
+    requires otx data to be loaded
+    """
+
+    def get_mappings(self, sentence):
+        """
+        Use trained model to predict the technique for a given sentence.
+        """
+        mappings = []
+
+        techniques = self.techniques_model.classes_
+        output = self.techniques_model.predict([sentence])
+
+        print(output)
+        # Create a list of tuples of (confidence, technique)
+        for i in range(len(output[0])):
+            if output[0][i] > 0:
+                mapping = Mapping(1, techniques[i])
+                mappings.append(mapping)
+
+        return mappings
+
+    def _load_and_vectorize_data(self):
+        """
+        Load training data from database.
+        Store sentence text in vector X
+        Store attack technique in vector y
+        """
+        X = []
+        y = []
+
+        # accepted_sents = self.get_training_data()
+        # reports = db_models.Report.objects.filter(ml_model='fullreport')
+        accepted_sents = db_models.Sentence.objects.filter(report__ml_model='fullreport')
+
+        for sent_obj in accepted_sents:  # Only store sentences with a labeled technique
+            sentence = sent_obj.text
+            # TODO: The below line omits all but the first mapped attack technique
+            temp = []
+            mappings = db_models.Mapping.objects.filter(sentence=sent_obj)
+            for mapping in mappings:
+                technique_label = mapping.attack_technique.attack_id
+                technique = technique_label[0:5]  # Cut string to technique level. leave out sub-technique
+                temp.append(technique)
+            X.append(sentence)
+            y.append(temp)
+        return X, y
+
+    def train(self):
+        """
+        Load and preprocess data. Train model pipeline
+        """
+        X, y = self._load_and_vectorize_data()
+        # print(X)
+        vals = np.array([np.array(i, dtype="object") for i in y])
+        label_encoder = MultiLabelBinarizer()
+        y_vec = label_encoder.fit_transform(vals)
+        X = [self.clean_text(x) for x in X]
+        self.techniques_model.fit(X, y_vec)  # Train classification model
+        self.last_trained = datetime.now(timezone.utc)
+
+    def test(self):
+        """
+        Return classification metrics based on train/test evaluation of the data
+        Note: potential extension is to use cross-validation rather than a single train/test split
+        """
+        X, y = self._load_and_vectorize_data()
+
+        # Create training set and test set
+        X_train, X_test, y_train, y_test = \
+            train_test_split(X, y, test_size=0.2, shuffle=True, random_state=0)
+
+        vals = np.array([np.array(i, dtype="object") for i in y_train])
+        label_encoder = MultiLabelBinarizer()
+        y_vec = label_encoder.fit_transform(vals)
+        X_train = [self.clean_text(x) for x in X_train]
+
+        self.techniques_model.fit(X_train, y_vec)  # Train classification model
+
+        X_test = [self.clean_text(x) for x in X_test]
+
+    class TextSelector(BaseEstimator, TransformerMixin):
+        """
+        Transformer to select a single column from the data frame to perform additional transformations on
+        Use on text columns in the data
+        """
+
+        def __init__(self, key):
+            self.key = key
+
+        def fit(self, X, y=None):
+            return self
+
+        def transform(self, X):
+            return X
+
+    def clean_text(self, text):
+        """
+        Cleaning up the words contractions, unusual spacing, non-word characters and any computer science
+        related terms that hinder the classification.
+        """
+        text = str(text)
+        text = text.lower()
+        text = re.sub("\r\n", "\t", text)
+        text = re.sub(r"what's", "what is ", text)
+        text = re.sub(r"\'s", " ", text)
+        text = re.sub(r"\'ve", " have ", text)
+        text = re.sub(r"can't", "can not ", text)
+        text = re.sub(r"n't", " not ", text)
+        text = re.sub(r"i'm", "i am ", text)
+        text = re.sub(r"\'re", " are ", text)
+        text = re.sub(r"\'d", " would ", text)
+        text = re.sub(r"\'ll", " will ", text)
+        text = re.sub(r"\'scuse", " excuse ", text)
+        text = re.sub(
+            r'''(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.)\{3\}
+            (?:25[0-5] |2[0-4][0-9]|[01]?[0-9][0-9]?)(/([0-2][0-9]|3[0-2]|[0-9]))?''',
+            'IPv4', text)
+        text = re.sub(r'\b(CVE\-[0-9]{4}\-[0-9]{4,6})\b', 'CVE', text)
+        text = re.sub(r'\b([a-z][_a-z0-9-.]+@[a-z0-9-]+\.[a-z]+)\b', 'email', text)
+        text = re.sub(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', 'IP', text)
+        text = re.sub(r'\b([a-f0-9]{32}|[A-F0-9]{32})\b', 'MD5', text)
+        text = re.sub(r'\b((HKLM|HKCU)\\[A-Za-z0-9-_]+)\b', 'registry', text)
+        text = re.sub(r'\b([a-f0-9]{40}|[A-F0-9]{40})\b', 'SHA1', text)
+        text = re.sub(r'\b([a-f0-9]{64}|[A-F0-9]{64})\b', 'SHA250', text)
+        text = re.sub(r'http(s)?:\\[0-9a-zA-Z_\.\-\\]+.', 'URL', text)
+        text = re.sub(r'CVE-[0-9]{4}-[0-9]{4,6}', 'vulnerability', text)
+        text = re.sub(r'[a-zA-Z]{1}:\\[0-9a-zA-Z_\.\-\\]+', 'file', text)
+        text = re.sub(r'\b[a-fA-F\d]{32}\b|\b[a-fA-F\d]{40}\b|\b[a-fA-F\d]{64}\b', 'hash', text)
+        text = re.sub(r'x[A-Fa-f0-9]{2}', ' ', text)
+        text = re.sub(r'\W', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip(' ')
+        return text
+
+    class StemTokenizer(object):
+        def __init__(self):
+            self.st = EnglishStemmer()
+
+        def __call__(self, doc):
+            return [self.st.stem(t) for t in word_tokenize(doc)]
+
+    def lemmatize(self, sentences):
+        lemma = nltk.stem.WordNetLemmatizer()
+        preprocessed_sentences = ""
+        for sentence in sentences:
+            # Lemmatize each word in sentence
+            sentence = ' '.join([lemma.lemmatize(w) for w in sentence.rstrip().split()])
+            sentence = re.sub(r'\d+', '', sentence)  # Remove digits with regex
+            preprocessed_sentences = preprocessed_sentences + ' ' + sentence
+        return [preprocessed_sentences]
+
+    def _sentence_tokenize(self, text):
+        return [text]
+
+    def get_model(self):
+        stop_words = stopwords.words('english')
+        new_stop_words = ["'ll", "'re", "'ve", 'ha', 'wa', "'d", "'s", 'abov', 'ani', 'becaus', 'befor',
+                          'could', 'doe', 'dure', 'might', 'must', "n't", 'need', 'onc', 'onli', 'ourselv',
+                          'sha', 'themselv', 'veri', 'whi', 'wo', 'would', 'yourselv']
+        stop_words.extend(new_stop_words)
+        return Pipeline([
+            # ('columnselector', self.TextSelector(key = 'processed')),
+            ('tfidf', tsk.TfidfVectorizer(tokenizer=self.StemTokenizer(), stop_words=stop_words)),
+            ('selection', SelectPercentile(chi2, percentile=50)),
+            ('classifier', OneVsRestClassifier(LinearSVC(penalty='l2', loss='squared_hinge',
+             dual=False, max_iter=1000, class_weight='balanced'), n_jobs=-1))
+        ])
+
 
 class ModelManager(object):
     model_registry = {  # TODO: Add a hook to register user-created models
-        "dummy": DummyModel,
-        "nb": NaiveBayesModel,
-        "logreg": LogisticRegressionModel,
+        'dummy': DummyModel,
+        'nb': NaiveBayesModel,
+        'logreg': LogisticRegressionModel,
+        'fullreport': FullReportModel,
+        'adversary': AdversaryModel,
         "nn_cls": MLPClassifierModel,
     }
 
